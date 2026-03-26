@@ -1,0 +1,96 @@
+name: Apply Environments (IaC)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/apply-environments.yml
+
+permissions:
+  contents: read
+
+jobs:
+  apply-environments:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+      REPO: ${{ github.repository }}
+
+    steps:
+      - name: Validate token exists
+        shell: bash
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "Missing GH_ADMIN_TOKEN secret."
+            echo "Create a classic PAT with repo + admin:repo_hook scope,"
+            echo "or a fine-grained token with Administration: Read/Write + Contents: Read."
+            exit 1
+          fi
+
+      - name: Create or update environments
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          create_env() {
+            local env_name="$1"
+            echo "Creating/updating environment '$env_name'"
+
+            payload=$(jq -n '{
+              wait_timer: 0,
+              prevent_self_review: false,
+              reviewers: [],
+              deployment_branch_policy: {
+                protected_branches: false,
+                custom_branch_policies: true
+              }
+            }')
+
+            gh api \
+              --method PUT \
+              -H "Accept: application/vnd.github+json" \
+              repos/$REPO/environments/$env_name \
+              --input - <<<"$payload"
+          }
+
+          create_env development
+          create_env staging
+          create_env production
+
+      - name: Enforce branch policy per environment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          set_policy() {
+            local env_name="$1"
+            local allowed_branch="$2"
+
+            echo "Setting branch policy for '$env_name' -> '$allowed_branch'"
+
+            ids=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              repos/$REPO/environments/$env_name/deployment-branch-policies \
+              --jq '.branch_policies[].id' || true)
+
+            if [ -n "$ids" ]; then
+              while IFS= read -r id; do
+                [ -z "$id" ] && continue
+                gh api \
+                  --method DELETE \
+                  -H "Accept: application/vnd.github+json" \
+                  repos/$REPO/environments/$env_name/deployment-branch-policies/$id
+              done <<< "$ids"
+            fi
+
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              repos/$REPO/environments/$env_name/deployment-branch-policies \
+              -f name="$allowed_branch" \
+              -f type="branch"
+          }
+
+          set_policy development dev
+          set_policy staging stage
+          set_policy production main

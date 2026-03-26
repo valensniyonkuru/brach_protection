@@ -1,0 +1,93 @@
+name: Apply Branch Protection (IaC)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/apply-branch-protection.yml
+      - .github/workflows/ci.yml
+
+permissions:
+  contents: read
+
+jobs:
+  apply-branch-protection:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+      REPO: ${{ github.repository }}
+      CHECK_FRONTEND: frontend-build-test
+      CHECK_BACKEND: backend-build-test
+
+    steps:
+      - name: Validate token exists
+        shell: bash
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "Missing GH_ADMIN_TOKEN secret."
+            echo "Create a classic PAT with repo + admin:repo_hook scope,"
+            echo "or a fine-grained token with Administration: Read/Write + Contents: Read."
+            exit 1
+          fi
+
+      - name: Ensure dev/stage/main branches exist
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          default_branch=$(gh api repos/$REPO --jq .default_branch)
+          default_sha=$(gh api repos/$REPO/git/ref/heads/$default_branch --jq .object.sha)
+
+          for branch in dev stage main; do
+            if gh api repos/$REPO/branches/$branch >/dev/null 2>&1; then
+              echo "Branch '$branch' already exists"
+            else
+              echo "Creating branch '$branch' from '$default_branch'"
+              gh api \
+                --method POST \
+                repos/$REPO/git/refs \
+                -f ref="refs/heads/$branch" \
+                -f sha="$default_sha"
+            fi
+          done
+
+      - name: Apply protection to dev/stage/main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for branch in dev stage main; do
+            echo "Applying protection for '$branch'"
+
+            payload=$(jq -n \
+              --arg c1 "$CHECK_FRONTEND" \
+              --arg c2 "$CHECK_BACKEND" \
+              '{
+                required_status_checks: {
+                  strict: true,
+                  contexts: [$c1, $c2]
+                },
+                enforce_admins: true,
+                required_pull_request_reviews: {
+                  dismiss_stale_reviews: true,
+                  require_code_owner_reviews: false,
+                  required_approving_review_count: 1
+                },
+                restrictions: null,
+                required_linear_history: false,
+                allow_force_pushes: false,
+                allow_deletions: false,
+                block_creations: false,
+                required_conversation_resolution: true,
+                lock_branch: false,
+                allow_fork_syncing: true
+              }')
+
+            gh api \
+              --method PUT \
+              -H "Accept: application/vnd.github+json" \
+              repos/$REPO/branches/$branch/protection \
+              --input - <<<"$payload"
+
+            echo "Protection applied for '$branch'"
+          done

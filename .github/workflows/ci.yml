@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, stage, main]
+  push:
+    branches: [dev, stage, main]
+
+permissions:
+  contents: read
+
+jobs:
+  frontend-build-test:
+    name: frontend-build-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Run frontend tests
+        working-directory: frontend
+        run: npm test -- --watch=false
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+  backend-build-test:
+    name: backend-build-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Build and test backend
+        working-directory: backend
+        shell: bash
+        run: |
+          if [ -x "./mvnw" ]; then
+            ./mvnw -B test
+          elif [ -f "pom.xml" ]; then
+            mvn -B test
+          elif [ -x "./gradlew" ]; then
+            ./gradlew test
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            gradle test
+          else
+            echo "No Maven or Gradle build file found in backend/" >&2
+            exit 1
+          fi
