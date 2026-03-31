@@ -1,9 +1,0 @@
-{
-  "name": "frontend",
-  "version": "0.1.0",
-  "private": true,
-  "scripts": {
-    "test": "echo \"Placeholder: no frontend tests yet\" && exit 0",
-    "build": "echo \"Placeholder: no frontend build yet\" && exit 0"
-  }
-}
