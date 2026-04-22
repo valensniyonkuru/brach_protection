@@ -54,6 +54,7 @@ jobs:
           }
 
           create_env development
+          create_env qa
           create_env staging
           create_env production
 
@@ -92,5 +93,6 @@ jobs:
           }
 
           set_policy development dev
+          set_policy qa qa
           set_policy staging stage
           set_policy production main
