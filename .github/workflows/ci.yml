@@ -198,8 +198,43 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Setup Java for Sonar analysis
+        if: hashFiles('backend/pom.xml', 'backend/build.gradle', 'backend/build.gradle.kts', 'backend/gradlew', 'backend/mvnw') != ''
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Prepare Sonar configuration
+        shell: bash
+        env:
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+          SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+        run: |
+          project_key="${SONAR_PROJECT_KEY:-${GITHUB_REPOSITORY/\//_}}"
+          organization="${SONAR_ORGANIZATION:-$GITHUB_REPOSITORY_OWNER}"
+
+          cat > sonar-project.properties <<EOF
+          sonar.projectKey=${project_key}
+          sonar.organization=${organization}
+          sonar.sources=backend/src/main,frontend/src,qa/smoke,proxy
+          sonar.tests=backend/src/test,qa/smoke
+          sonar.exclusions=**/node_modules/**,**/dist/**,**/target/**
+          EOF
+
+      - name: Compile backend classes for Sonar
+        if: hashFiles('backend/pom.xml', 'backend/mvnw') != ''
+        working-directory: backend
+        shell: bash
+        run: |
+          if [ -x "./mvnw" ]; then
+            ./mvnw -B -DskipTests compile
+          else
+            mvn -B -DskipTests compile
+          fi
+
       - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@v5
+        uses: SonarSource/sonarqube-scan-action@v6
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
