@@ -18,6 +18,7 @@ jobs:
       REPO: ${{ github.repository }}
       CHECK_FRONTEND: frontend-build-test
       CHECK_BACKEND: backend-build-test
+      CHECK_QA: qa-smoke-test
 
     steps:
       - name: Validate token exists
@@ -30,7 +31,7 @@ jobs:
             exit 1
           fi
 
-      - name: Ensure dev/stage/main branches exist
+      - name: Ensure dev/qa/stage/main branches exist
         shell: bash
         run: |
           set -euo pipefail
@@ -38,7 +39,7 @@ jobs:
           default_branch=$(gh api repos/$REPO --jq .default_branch)
           default_sha=$(gh api repos/$REPO/git/ref/heads/$default_branch --jq .object.sha)
 
-          for branch in dev stage main; do
+          for branch in dev qa stage main; do
             if gh api repos/$REPO/branches/$branch >/dev/null 2>&1; then
               echo "Branch '$branch' already exists"
             else
@@ -51,21 +52,22 @@ jobs:
             fi
           done
 
-      - name: Apply protection to dev/stage/main
+      - name: Apply protection to dev/qa/stage/main
         shell: bash
         run: |
           set -euo pipefail
 
-          for branch in dev stage main; do
+          for branch in dev qa stage main; do
             echo "Applying protection for '$branch'"
 
             payload=$(jq -n \
               --arg c1 "$CHECK_FRONTEND" \
               --arg c2 "$CHECK_BACKEND" \
+              --arg c3 "$CHECK_QA" \
               '{
                 required_status_checks: {
                   strict: true,
-                  contexts: [$c1, $c2]
+                  contexts: [$c1, $c2, $c3]
                 },
                 enforce_admins: true,
                 required_pull_request_reviews: {

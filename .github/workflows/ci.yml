@@ -2,16 +2,20 @@ name: CI
 
 on:
   pull_request:
-    branches: [dev, stage, main]
+    branches: [dev, qa, stage, main]
   push:
-    branches: [dev, stage, main]
+    branches: [dev, qa, stage, main]
 
 permissions:
   contents: read
+  security-events: write  # required to upload SARIF results to GitHub Security tab
 
 jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Stage 1 – Build & Test (parallel)
+  # ──────────────────────────────────────────────────────────────
   frontend-build-test:
-    name: frontend-build-test
+    name: Frontend Build & Test
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.detect.outputs.should_run }}
@@ -68,7 +72,7 @@ jobs:
         run: echo "frontend/package.json not found; skipping frontend job."
 
   backend-build-test:
-    name: backend-build-test
+    name: Backend Build & Test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -102,3 +106,304 @@ jobs:
             echo "No Maven/Gradle project files found in backend/; skipping backend job."
             exit 0
           fi
+
+  qa-smoke-test:
+    name: QA Smoke Test
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.detect.outputs.should_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect qa project
+        id: detect
+        shell: bash
+        run: |
+          if [ -f "qa/package.json" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Node (with cache)
+        if: steps.detect.outputs.should_run == 'true' && hashFiles('qa/package-lock.json') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: qa/package-lock.json
+
+      - name: Setup Node (no cache)
+        if: steps.detect.outputs.should_run == 'true' && hashFiles('qa/package-lock.json') == ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install qa dependencies
+        if: steps.detect.outputs.should_run == 'true'
+        working-directory: qa
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Run qa smoke tests
+        if: steps.detect.outputs.should_run == 'true'
+        working-directory: qa
+        run: npm test
+
+      - name: QA not present (no-op)
+        if: steps.detect.outputs.should_run != 'true'
+        run: echo "qa/package.json not found; skipping qa job."
+
+  # ──────────────────────────────────────────────────────────────
+  # Stage 2 – Static Security Scans (parallel, gated on Stage 1)
+  # ──────────────────────────────────────────────────────────────
+  owasp-dependency-check:
+    name: OWASP Dependency Check
+    runs-on: ubuntu-latest
+    needs: [frontend-build-test, backend-build-test, qa-smoke-test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: ${{ github.repository }}
+          path: "."
+          format: "SARIF"
+          args: >
+            --enableRetired
+            --failOnCVSS 7
+            --nvdApiKey ${{ secrets.NVD_API_KEY }}
+
+      - name: Upload OWASP SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/dependency-check-report.sarif
+          category: owasp-dependency-check
+
+  sonarqube-analysis:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    needs: [frontend-build-test, backend-build-test, qa-smoke-test]
+    steps:
+      - name: Checkout (full history for blame data)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java for Sonar analysis
+        if: hashFiles('backend/pom.xml', 'backend/build.gradle', 'backend/build.gradle.kts', 'backend/gradlew', 'backend/mvnw') != ''
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Prepare Sonar configuration
+        shell: bash
+        env:
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+          SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+        run: |
+          project_key="${SONAR_PROJECT_KEY:-${GITHUB_REPOSITORY/\//_}}"
+          organization="${SONAR_ORGANIZATION:-$GITHUB_REPOSITORY_OWNER}"
+
+          cat > sonar-project.properties <<EOF
+          sonar.projectKey=${project_key}
+          sonar.organization=${organization}
+          sonar.sources=backend/src/main,frontend/src,qa/smoke,proxy
+          sonar.tests=backend/src/test,qa/smoke
+          sonar.exclusions=**/node_modules/**,**/dist/**,**/target/**
+          EOF
+
+      - name: Compile backend classes for Sonar
+        if: hashFiles('backend/pom.xml', 'backend/mvnw') != ''
+        working-directory: backend
+        shell: bash
+        run: |
+          if [ -x "./mvnw" ]; then
+            ./mvnw -B -DskipTests compile
+          else
+            mvn -B -DskipTests compile
+          fi
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: SonarQube Quality Gate check
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  # Sentinel job: surfaces a clear failure message when any static scan fails
+  static-scan-failure:
+    name: Static Scan Failure
+    runs-on: ubuntu-latest
+    needs: [owasp-dependency-check, sonarqube-analysis]
+    if: failure()
+    steps:
+      - name: Report static scan failure
+        run: |
+          echo "::error::One or more static security scans failed."
+          echo "::error::Review OWASP Dependency Check and/or SonarQube results before merging."
+          exit 1
+
+  # ──────────────────────────────────────────────────────────────
+  # Stage 3 – Docker Builds (parallel matrix: frontend / backend / proxy)
+  # ──────────────────────────────────────────────────────────────
+  build-service-images:
+    name: Build ${{ matrix.service }} image
+    runs-on: ubuntu-latest
+    needs: [owasp-dependency-check, sonarqube-analysis]
+    if: success()
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: frontend
+            dockerfile: frontend/Dockerfile
+          - service: backend
+            dockerfile: backend/Dockerfile
+          - service: proxy
+            dockerfile: proxy/Dockerfile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.service }} image (tar, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          tags: ${{ github.repository }}-${{ matrix.service }}:${{ github.sha }}
+          outputs: type=docker,dest=/tmp/${{ matrix.service }}-image.tar
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+
+      - name: Upload ${{ matrix.service }} image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ matrix.service }}-${{ github.sha }}
+          path: /tmp/${{ matrix.service }}-image.tar
+          retention-days: 1
+
+  # ──────────────────────────────────────────────────────────────
+  # Stage 4 – Trivy Image Scan (parallel matrix: one scan per image)
+  # ──────────────────────────────────────────────────────────────
+  trivy-image-scan:
+    name: Trivy scan – ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: [build-service-images]
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [frontend, backend, proxy]
+    steps:
+      - name: Download ${{ matrix.service }} image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ matrix.service }}-${{ github.sha }}
+          path: /tmp
+
+      - name: Run Trivy vulnerability scan on tar
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          input: /tmp/${{ matrix.service }}-image.tar
+          format: sarif
+          output: trivy-${{ matrix.service }}.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.service }}.sarif
+          category: trivy-${{ matrix.service }}
+
+  # Sentinel job: surfaces a clear failure message when any image scan fails
+  image-scan-failure:
+    name: Image Scan Failure
+    runs-on: ubuntu-latest
+    needs: [trivy-image-scan]
+    if: failure()
+    steps:
+      - name: Report image scan failure
+        run: |
+          echo "::error::Trivy found CRITICAL or HIGH vulnerabilities in one or more service images."
+          echo "::error::Check the trivy-frontend / trivy-backend / trivy-proxy scan results."
+          exit 1
+
+  # ──────────────────────────────────────────────────────────────
+  # Stage 5 – Push Images to Registry (parallel matrix, clean scan only)
+  # ──────────────────────────────────────────────────────────────
+  push-service-images:
+    name: Push ${{ matrix.service }} image
+    runs-on: ubuntu-latest
+    needs: [trivy-image-scan]
+    if: >
+      success() &&
+      (
+        github.ref == 'refs/heads/main' ||
+        github.ref == 'refs/heads/stage' ||
+        github.ref == 'refs/heads/dev'
+      )
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: frontend
+            dockerfile: frontend/Dockerfile
+          - service: backend
+            dockerfile: backend/Dockerfile
+          - service: proxy
+            dockerfile: proxy/Dockerfile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          BRANCH="${GITHUB_REF##*/}"
+          SHORT_SHA="${GITHUB_SHA::8}"
+          REPO_NAME="$(echo '${{ github.repository }}' | cut -d/ -f2 | tr '[:upper:]' '[:lower:]')"
+          echo "image=${{ secrets.DOCKERHUB_USERNAME }}/${REPO_NAME}-${{ matrix.service }}" >> "$GITHUB_OUTPUT"
+          echo "tag=${BRANCH}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push ${{ matrix.service }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.tag }}
+            ${{ steps.tag.outputs.image }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
