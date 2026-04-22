@@ -8,10 +8,14 @@ on:
 
 permissions:
   contents: read
+  security-events: write  # required to upload SARIF results to GitHub Security tab
 
 jobs:
+  # ──────────────────────────────────────────────────────────────
+  # Stage 1 – Build & Test (parallel)
+  # ──────────────────────────────────────────────────────────────
   frontend-build-test:
-    name: frontend-build-test
+    name: Frontend Build & Test
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.detect.outputs.should_run }}
@@ -68,7 +72,7 @@ jobs:
         run: echo "frontend/package.json not found; skipping frontend job."
 
   backend-build-test:
-    name: backend-build-test
+    name: Backend Build & Test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -102,3 +106,194 @@ jobs:
             echo "No Maven/Gradle project files found in backend/; skipping backend job."
             exit 0
           fi
+
+  # ──────────────────────────────────────────────────────────────
+  # Stage 2 – Static Security Scans (parallel, gated on Stage 1)
+  # ──────────────────────────────────────────────────────────────
+  owasp-dependency-check:
+    name: OWASP Dependency Check
+    runs-on: ubuntu-latest
+    needs: [frontend-build-test, backend-build-test]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: ${{ github.repository }}
+          path: "."
+          format: "SARIF"
+          args: >
+            --enableRetired
+            --failOnCVSS 7
+            --nvdApiKey ${{ secrets.NVD_API_KEY }}
+
+      - name: Upload OWASP SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/dependency-check-report.sarif
+          category: owasp-dependency-check
+
+  sonarqube-analysis:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    needs: [frontend-build-test, backend-build-test]
+    steps:
+      - name: Checkout (full history for blame data)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: SonarQube Quality Gate check
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  # Sentinel job: surfaces a clear failure message when any static scan fails
+  static-scan-failure:
+    name: Static Scan Failure
+    runs-on: ubuntu-latest
+    needs: [owasp-dependency-check, sonarqube-analysis]
+    if: failure()
+    steps:
+      - name: Report static scan failure
+        run: |
+          echo "::error::One or more static security scans failed."
+          echo "::error::Review OWASP Dependency Check and/or SonarQube results before merging."
+          exit 1
+
+  # ──────────────────────────────────────────────────────────────
+  # Stage 3 – Docker Build (only when Stage 2 fully passes)
+  # ──────────────────────────────────────────────────────────────
+  build-docker-image:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [owasp-dependency-check, sonarqube-analysis]
+    if: success()
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (tar, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: ${{ github.repository }}:${{ github.sha }}
+          outputs: type=docker,dest=/tmp/image.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ github.sha }}
+          path: /tmp/image.tar
+          retention-days: 1
+
+  # ──────────────────────────────────────────────────────────────
+  # Stage 4 – Trivy Image Scan
+  # ──────────────────────────────────────────────────────────────
+  trivy-image-scan:
+    name: Trivy Image Scan
+    runs-on: ubuntu-latest
+    needs: [build-docker-image]
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image-${{ github.sha }}
+          path: /tmp
+
+      - name: Load Docker image
+        run: docker load --input /tmp/image.tar
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          image-ref: ${{ github.repository }}:${{ github.sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-image-scan
+
+  # Sentinel job: surfaces a clear failure message when the image scan fails
+  image-scan-failure:
+    name: Image Scan Failure
+    runs-on: ubuntu-latest
+    needs: [trivy-image-scan]
+    if: failure()
+    steps:
+      - name: Report image scan failure
+        run: |
+          echo "::error::Trivy found CRITICAL or HIGH vulnerabilities in the Docker image."
+          echo "::error::Fix the vulnerabilities above before pushing to the registry."
+          exit 1
+
+  # ──────────────────────────────────────────────────────────────
+  # Stage 5 – Push Docker Image to Registry (only on clean scan)
+  # ──────────────────────────────────────────────────────────────
+  push-docker-image:
+    name: Push Docker Image to Registry
+    runs-on: ubuntu-latest
+    needs: [trivy-image-scan]
+    if: >
+      success() &&
+      (
+        github.ref == 'refs/heads/main' ||
+        github.ref == 'refs/heads/stage' ||
+        github.ref == 'refs/heads/dev'
+      )
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          BRANCH="${GITHUB_REF##*/}"
+          SHORT_SHA="${GITHUB_SHA::8}"
+          REPO_NAME="$(echo '${{ github.repository }}' | cut -d/ -f2)"
+          echo "image=${{ secrets.DOCKERHUB_USERNAME }}/${REPO_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${BRANCH}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.tag.outputs.image }}:${{ steps.tag.outputs.tag }}
+            ${{ steps.tag.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
